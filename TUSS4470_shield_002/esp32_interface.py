@@ -15,15 +15,40 @@ import pyqtgraph as pg
 import qdarktheme
 
 # ESP32-C3 firmware line format:
-# sp343, 390, 412, ... (exactly 300 ADC readings)
+# sp343, 390, 412, ... (exactly 250 ADC readings)
 BAUD_RATE = 115200
 NUM_SAMPLES = 250
 MAX_ROWS = 300
 ADC_MAX = 4095
+# Real pings start with the transmit ring-down; extra triggers without a ping do not.
+RINGDOWN_SAMPLES = 4
+DEFAULT_PING_THRESHOLD = 1700
+DEFAULT_ECHO_THRESHOLD_PERCENT = 50
 
 
 def get_serial_ports():
     return [p.device for p in serial.tools.list_ports.comports()]
+
+
+def find_first_echo(values, start, threshold_percent):
+    """Return (sample index, threshold level) of the first echo peak after `start`, or None.
+
+    The threshold sits `threshold_percent` of the way from the baseline (median) to the
+    strongest reading, so it adapts to the ADC offset. Once a sample crosses it, the
+    rising edge is followed to its local peak.
+    """
+    segment = values[start:]
+    if segment.size == 0:
+        return None
+    baseline = float(np.median(segment))
+    peak = float(segment.max())
+    if peak <= baseline:
+        return None
+    level = baseline + (peak - baseline) * threshold_percent / 100.0
+    i = int(np.argmax(segment >= level))
+    while i + 1 < segment.size and segment[i + 1] >= segment[i]:
+        i += 1
+    return start + i, level
 
 
 def parse_esp32_line(line):
@@ -75,6 +100,7 @@ class WaterfallApp(QMainWindow):
         self.reader = None
         self.row_count = 0
         self.capture_count = 0
+        self.rejected_count = 0
         self.data = np.full((MAX_ROWS, NUM_SAMPLES), np.nan, dtype=np.float32)
         self.last_values = None
 
@@ -98,6 +124,11 @@ class WaterfallApp(QMainWindow):
         self.wave_plot.setXRange(0, NUM_SAMPLES - 1, padding=0)
         self.wave_plot.setYRange(0, ADC_MAX, padding=0)
         self.wave_curve = self.wave_plot.plot(pen=pg.mkPen(width=1.5))
+        self.echo_marker = pg.InfiniteLine(angle=90, pen=pg.mkPen("r", width=1.5))
+        self.echo_level = pg.InfiniteLine(angle=0, pen=pg.mkPen("r", width=1, style=pg.QtCore.Qt.DashLine))
+        for line in (self.echo_marker, self.echo_level):
+            line.hide()
+            self.wave_plot.addItem(line)
         root.addWidget(self.wave_plot, stretch=2)
 
         # Waterfall
@@ -136,6 +167,51 @@ class WaterfallApp(QMainWindow):
         controls.addWidget(self.gradient_combo)
         root.addLayout(controls)
 
+        calibration = QHBoxLayout()
+        calibration.addWidget(QLabel("Ignore first samples:"))
+        self.blind_samples = QSpinBox()
+        self.blind_samples.setRange(0, NUM_SAMPLES - 1)
+        self.blind_samples.setValue(6)
+        self.blind_samples.valueChanged.connect(self.update_strongest)
+        calibration.addWidget(self.blind_samples)
+
+        calibration.addWidget(QLabel("Distance per sample (cm):"))
+        self.distance_per_sample = QDoubleSpinBox()
+        self.distance_per_sample.setDecimals(3)
+        self.distance_per_sample.setRange(0.001, 1000)
+        self.distance_per_sample.setValue(2.5)
+        self.distance_per_sample.valueChanged.connect(self.update_strongest)
+        calibration.addWidget(self.distance_per_sample)
+
+        calibration.addWidget(QLabel("Distance offset (cm):"))
+        self.distance_offset = QDoubleSpinBox()
+        self.distance_offset.setDecimals(2)
+        self.distance_offset.setRange(-10000, 10000)
+        self.distance_offset.setValue(10)
+        self.distance_offset.valueChanged.connect(self.update_strongest)
+        calibration.addWidget(self.distance_offset)
+
+        calibration.addWidget(QLabel("Echo threshold (%):"))
+        self.echo_threshold = QSpinBox()
+        self.echo_threshold.setRange(1, 100)
+        self.echo_threshold.setValue(DEFAULT_ECHO_THRESHOLD_PERCENT)
+        self.echo_threshold.setToolTip(
+            "First echo = first peak reaching this percentage of the way from the "
+            "baseline to the strongest reading. Lower it to catch weaker near echoes."
+        )
+        self.echo_threshold.valueChanged.connect(self.update_strongest)
+        calibration.addWidget(self.echo_threshold)
+        calibration.addWidget(QLabel("Ping threshold (0 = off):"))
+        self.ping_threshold = QSpinBox()
+        self.ping_threshold.setRange(0, ADC_MAX)
+        self.ping_threshold.setValue(DEFAULT_PING_THRESHOLD)
+        self.ping_threshold.setToolTip(
+            f"Captures whose first {RINGDOWN_SAMPLES} samples average below this are "
+            "treated as non-ping triggers and discarded."
+        )
+        calibration.addWidget(self.ping_threshold)
+        root.addLayout(calibration)
+
         options = QHBoxLayout()
         self.auto_scale = QCheckBox("Auto-scale each capture (waveform)")
         self.auto_scale.setChecked(True)
@@ -161,9 +237,11 @@ class WaterfallApp(QMainWindow):
         options.addWidget(self.clear_button)
         root.addLayout(options)
 
-        self.status_label = QLabel("Connect to the ESP32-C3. Expected format: 'sp' + 300 comma-separated ADC values.")
+        self.status_label = QLabel("Connect to the ESP32-C3. Expected format: 'sp' + 250 comma-separated ADC values.")
         self.status_label.setWordWrap(True)
         root.addWidget(self.status_label)
+        self.strongest_label = QLabel("First echo: waiting for capture.")
+        root.addWidget(self.strongest_label)
         self.latest_label = QLabel("No captures received yet.")
         root.addWidget(self.latest_label)
 
@@ -194,7 +272,14 @@ class WaterfallApp(QMainWindow):
         self.reader.start()
         self.connect_button.setText("Disconnect")
 
+    def is_ping(self, values):
+        threshold = self.ping_threshold.value()
+        return threshold == 0 or float(values[:RINGDOWN_SAMPLES].mean()) >= threshold
+
     def on_samples(self, values):
+        if not self.is_ping(values):
+            self.rejected_count += 1
+            return
         self.last_values = values.copy()
         self.capture_count += 1
 
@@ -215,8 +300,35 @@ class WaterfallApp(QMainWindow):
         self.image.setImage(self.data, autoLevels=False, levels=(self.level_min.value(), self.level_max.value()))
         self.latest_label.setText(
             f"Capture {self.capture_count} | min {int(values.min())} | max {int(values.max())} | "
-            f"mean {float(values.mean()):.1f} | peak-to-peak {int(values.max()-values.min())} counts"
+            f"mean {float(values.mean()):.1f} | peak-to-peak {int(values.max()-values.min())} counts | "
+            f"{self.rejected_count} non-ping captures discarded"
         )
+        self.update_strongest()
+
+    def update_strongest(self, *_):
+        if self.last_values is None:
+            return
+        echo = find_first_echo(self.last_values, self.blind_samples.value(), self.echo_threshold.value())
+        if echo is None:
+            self.echo_marker.hide()
+            self.echo_level.hide()
+            self.strongest_label.setText("First echo: none found above the baseline.")
+            return
+        index, level = echo
+        self.echo_marker.setPos(index)
+        self.echo_level.setPos(level)
+        self.echo_marker.show()
+        self.echo_level.show()
+        distance = index * self.distance_per_sample.value() + self.distance_offset.value()
+        if distance < 0:
+            self.strongest_label.setText(
+                f"First echo: sample {index}; negative distance, check calibration."
+            )
+        else:
+            self.strongest_label.setText(
+                f"First echo: {distance:.1f} cm | sample {index} | "
+                f"{int(self.last_values[index])} counts"
+            )
 
     def update_waveform(self, *_):
         if self.last_values is None:
@@ -247,10 +359,14 @@ class WaterfallApp(QMainWindow):
         self.data[:] = np.nan
         self.row_count = 0
         self.capture_count = 0
+        self.rejected_count = 0
         self.last_values = None
         self.wave_curve.setData([], [])
         self.wave_plot.setYRange(0, ADC_MAX, padding=0)
         self.image.setImage(self.data, autoLevels=False, levels=(self.level_min.value(), self.level_max.value()))
+        self.strongest_label.setText("First echo: waiting for capture.")
+        self.echo_marker.hide()
+        self.echo_level.hide()
         self.latest_label.setText("Plot cleared; waiting for next capture.")
 
     def closeEvent(self, event):
