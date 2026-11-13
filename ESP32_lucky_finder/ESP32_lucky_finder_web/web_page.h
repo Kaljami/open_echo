@@ -24,6 +24,7 @@ legend { color: #aaa; }
 label { display: flex; gap: 6px; align-items: center; }
 input[type=number] { width: 80px; background: #2a2a2a; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 3px; }
 select, button { background: #2a2a2a; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 4px 8px; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
 .muted { color: #999; }
 .offline { color: #ff6b6b; }
 </style>
@@ -35,6 +36,11 @@ select, button { background: #2a2a2a; color: #eee; border: 1px solid #444; borde
     <div id="echoInfo" class="muted">Waiting for capture.</div>
     <div id="conn" class="muted" style="margin-left:auto">Connecting...</div>
   </div>
+  <fieldset>
+    <legend>Lucky Finder power</legend>
+    <button id="powerOn" disabled>Turn on Lucky Finder</button>
+    <span id="powerStatus" class="muted" role="status">Connecting...</span>
+  </fieldset>
   <div class="panel"><h2>Latest capture</h2><canvas id="wave"></canvas></div>
   <div class="panel"><h2>Waterfall (each row is one ping, newest at bottom)</h2><canvas id="water"></canvas></div>
   <fieldset>
@@ -75,6 +81,7 @@ try { Object.assign(view, JSON.parse(localStorage.getItem('openEchoView') || '{}
 
 let rows = [], echoes = [], latest = null, shown = 0, lastSeq = 0;
 let data = null, settings = null, lut = null, rejectedBase = null, lateBase = null;
+let powerRequestPending = false, powerBusy = false, powerStatusKnown = false;
 const offscreen = document.createElement('canvas');
 
 function buildLut(name) {
@@ -228,6 +235,35 @@ function addCapture(c) {
 function setConnected(ok) {
   $('conn').textContent = ok ? 'Connected' : 'Connection lost, retrying...';
   $('conn').className = ok ? 'muted' : 'offline';
+  $('powerOn').disabled = !ok || powerRequestPending || powerBusy;
+}
+
+function showPowerState(busy) {
+  if (powerRequestPending) return;
+  if (powerStatusKnown && busy === powerBusy) return;
+  powerStatusKnown = true;
+  $('powerStatus').className = 'muted';
+  $('powerStatus').textContent = busy ? 'Power-on sequence running (7 seconds)...' :
+    powerBusy ? 'Sequence complete; power state is not verified.' : 'Ready (1 s ground, 5 s release, 1 s ground).';
+  powerBusy = busy;
+}
+
+async function turnOnLuckyFinder() {
+  powerRequestPending = true;
+  $('powerOn').disabled = true;
+  $('powerStatus').className = 'muted';
+  $('powerStatus').textContent = 'Starting power-on sequence...';
+  try {
+    const r = await fetch('/power/on', { method: 'POST' });
+    if (!r.ok) throw new Error(await r.text());
+    const result = await r.json();
+    powerRequestPending = false;
+    showPowerState(result.powerBusy);
+  } catch (err) {
+    powerRequestPending = false;
+    $('powerStatus').className = 'offline';
+    $('powerStatus').textContent = 'Power-on request failed: ' + err.message + '. Check the device before retrying.';
+  }
 }
 
 async function poll() {
@@ -241,6 +277,7 @@ async function poll() {
       if (c.seq > lastSeq) { addCapture(c); lastSeq = c.seq; }
     }
     data = d;
+    showPowerState(d.powerBusy);
     render();
     setConnected(true);
   } catch (err) {
@@ -318,6 +355,7 @@ $('levelMax').value = view.levelMax;
 ['autoScale', 'markEcho', 'levelMin', 'levelMax', 'cmap'].forEach(id => $(id).addEventListener('change', updateView));
 SETTINGS.forEach(k => $(k).addEventListener('change', saveSettings));
 $('clear').addEventListener('click', clearPlot);
+$('powerOn').addEventListener('click', turnOnLuckyFinder);
 window.addEventListener('resize', render);
 updateView();
 loadSettings();

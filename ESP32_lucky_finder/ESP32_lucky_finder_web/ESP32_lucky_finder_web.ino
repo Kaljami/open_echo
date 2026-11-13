@@ -6,7 +6,7 @@
   web interface with a live waveform, waterfall, distance readout and all settings.
 
   Board: "ESP32S3 Dev Module" with "USB CDC On Boot: Enabled" for USB serial output.
-  Also builds for the ESP32-C3 SuperMini ("ESP32C3 Dev Module"). See README.md for setup.
+  ESP32-S3 only. See README.md for setup and the required power-button transistor.
 */
 
 #include <WiFi.h>
@@ -16,6 +16,10 @@
 #include <math.h>
 #include "echo_processing.h"
 #include "web_page.h"
+
+#if !defined(CONFIG_IDF_TARGET_ESP32S3)
+#error "This sketch requires an ESP32-S3 board."
+#endif
 
 // ---------------------- WiFi ----------------------
 // Leave WIFI_SSID empty to always start an access point instead of joining a network.
@@ -28,8 +32,11 @@ const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 
 // ---------------------- Hardware ----------------------
 const int INTERRUPT_PIN = 1;  // GPIO1: trigger input (falling edge)
-const int ANALOG_PIN = 4;     // GPIO4: echo signal; must be an ADC1 pin (S3: GPIO1-10, C3: GPIO0-4) because ADC2 is unavailable with WiFi on
+const int ANALOG_PIN = 4;     // GPIO4: echo signal; must be an ADC1 pin (GPIO1-10) because ADC2 is unavailable with WiFi on
+const int POWER_PIN = 5;      // GPIO5: external NPN base through 2.2k resistor (HIGH = pressed); never wire directly to button
 const int NUM_SAMPLES = 250;
+const uint32_t POWER_PRESS_MS = 1000;
+const uint32_t POWER_WAIT_MS = 5000;
 
 // ---------------------- Processing ----------------------
 const size_t RINGDOWN_SAMPLES = 4;              // samples averaged for the ping threshold
@@ -68,6 +75,41 @@ volatile uint32_t triggerUs = 0;
 
 WebServer server(80);
 Preferences prefs;
+
+enum class PowerState { Idle, FirstPress, Waiting, SecondPress };
+PowerState powerState = PowerState::Idle;
+uint32_t powerStateStartedMs = 0;
+
+// ---------------------- Lucky Finder power button ----------------------
+
+void updatePowerSequence() {
+  uint32_t now = millis();
+  uint32_t elapsed = now - powerStateStartedMs;
+  switch (powerState) {
+    case PowerState::FirstPress:
+      if (elapsed >= POWER_PRESS_MS) {
+        digitalWrite(POWER_PIN, LOW);
+        powerState = PowerState::Waiting;
+        powerStateStartedMs = now;
+      }
+      break;
+    case PowerState::Waiting:
+      if (elapsed >= POWER_WAIT_MS) {
+        digitalWrite(POWER_PIN, HIGH);
+        powerState = PowerState::SecondPress;
+        powerStateStartedMs = now;
+      }
+      break;
+    case PowerState::SecondPress:
+      if (elapsed >= POWER_PRESS_MS) {
+        digitalWrite(POWER_PIN, LOW);
+        powerState = PowerState::Idle;
+      }
+      break;
+    case PowerState::Idle:
+      break;
+  }
+}
 
 // ---------------------- Settings ----------------------
 
@@ -252,6 +294,8 @@ void handleData() {
   json += late;
   json += ",\"samplePeriodUs\":";
   json += String(period, 2);
+  json += ",\"powerBusy\":";
+  json += powerState != PowerState::Idle ? "true" : "false";
   json += ",\"echo\":";
   if (seq > 0 && echo.found) {
     json += "{\"index\":";
@@ -286,6 +330,17 @@ void handleData() {
   }
   json += "]}";
   sendJson(json);
+}
+
+void handlePowerOn() {
+  if (powerState != PowerState::Idle) {
+    server.send(409, "text/plain", "Power-on sequence already running");
+    return;
+  }
+  digitalWrite(POWER_PIN, HIGH);
+  powerStateStartedMs = millis();
+  powerState = PowerState::FirstPress;
+  sendJson("{\"powerBusy\":true}");
 }
 
 void handleGetSettings() {
@@ -368,6 +423,9 @@ void startWifi() {
 }
 
 void setup() {
+  digitalWrite(POWER_PIN, LOW);
+  pinMode(POWER_PIN, OUTPUT);
+
   Serial.begin(115200);
   delay(1000);
   Serial.println("Open Echo ESP32 web viewer starting");
@@ -382,12 +440,8 @@ void setup() {
   analogRead(ANALOG_PIN);    // configure the ADC channel before the first capture
 
   // Highest priority so a capture starts right after the trigger; each capture lasts only milliseconds.
-  // On dual-core chips (S3) it shares the Arduino core with the trigger interrupt, while WiFi runs on the other core.
-#if CONFIG_FREERTOS_UNICORE
-  xTaskCreate(captureTask, "capture", 4096, nullptr, configMAX_PRIORITIES - 1, &captureTaskHandle);
-#else
+  // It shares the Arduino core with the trigger interrupt, while WiFi runs on the other core.
   xTaskCreatePinnedToCore(captureTask, "capture", 4096, nullptr, configMAX_PRIORITIES - 1, &captureTaskHandle, xPortGetCoreID());
-#endif
   attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), onTrigger, FALLING);
 
   startWifi();
@@ -399,11 +453,13 @@ void setup() {
   server.on("/data", HTTP_GET, handleData);
   server.on("/settings", HTTP_GET, handleGetSettings);
   server.on("/settings", HTTP_POST, handlePostSettings);
+  server.on("/power/on", HTTP_POST, handlePowerOn);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
 }
 
 void loop() {
+  updatePowerSequence();
   server.handleClient();
   if (SERIAL_STREAM) {
     printPendingCapture();

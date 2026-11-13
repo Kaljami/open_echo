@@ -2,3 +2,4 @@ __pycache__/
 .*
 !.gitignore
 venv/
+component_catalog.csv
